@@ -1,0 +1,390 @@
+# -*- coding: utf-8 -*-
+"""
+TypeWriter — exteraGram plugin.
+Command: .type <text>
+
+Sends the first character, then edits that same Telegram message,
+adding one character at a time.
+"""
+
+import random
+import re
+import threading
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from ui.settings import Header, Switch, Selector, Text
+from client_utils import (
+    send_request,
+    run_on_queue,
+    GLOBAL_QUEUE,
+    get_messages_controller,
+)
+from org.telegram.tgnet import TLRPC
+
+
+__id__ = "typewriter"
+__name__ = "TypeWriter"
+__description__ = "Печатает сообщение по буквам через последовательное редактирование."
+__author__ = "@l_am_ziggy"
+__version__ = "1.1.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+__category__ = ["chats", "tools"]
+
+
+class TypeWriterPlugin(BasePlugin):
+    SPEEDS = [250, 350, 500, 700, 1000]
+    MAX_TEXT_LENGTH = 3500
+
+    def on_plugin_load(self):
+        self._lock = threading.RLock()
+        self._pending = {}
+        self.add_on_send_message_hook(priority=100)
+        self.add_hook("TL_messages_sendMessage", priority=100)
+        self.log("TypeWriter 1.1.0 loaded")
+
+    def on_plugin_unload(self):
+        with self._lock:
+            self._pending.clear()
+        self.log("TypeWriter unloaded")
+
+    def create_settings(self):
+        return [
+            Header(text="TypeWriter"),
+            Selector(
+                key="speed_index",
+                text="Скорость печати",
+                default=1,
+                items=[
+                    "250 мс — очень быстро",
+                    "350 мс — быстро",
+                    "500 мс — обычно",
+                    "700 мс — медленно",
+                    "1000 мс — очень медленно",
+                ],
+                icon="msg_speed",
+            ),
+            Switch(
+                key="random_delay",
+                text="Случайные задержки",
+                default=False,
+                subtext="Добавляет небольшую вариативность между буквами.",
+                icon="msg_clock",
+            ),
+            Switch(
+                key="floodwait_protection",
+                text="FloodWait Protection",
+                default=True,
+                subtext="При FloodWait подождёт указанное время и продолжит.",
+                icon="msg_info",
+            ),
+            Text(
+                text="Команда: .type Привет!",
+                subtext="Создаётся одно сообщение, которое постепенно дополняется.",
+                icon="msg_help",
+            ),
+        ]
+
+    def _speed_ms(self):
+        try:
+            index = int(self.get_setting("speed_index", 1))
+            index = max(0, min(index, len(self.SPEEDS) - 1))
+            return self.SPEEDS[index]
+        except Exception:
+            return 350
+
+    def _next_delay(self):
+        delay = self._speed_ms()
+        if self.get_setting("random_delay", False):
+            delay += random.randint(0, max(40, int(delay * 0.35)))
+        return delay
+
+    @staticmethod
+    def _split_text(text):
+        """Split text into approximate grapheme clusters (keeps emoji together)."""
+        result = []
+        current = ""
+        join_next = False
+        regional_count = 0
+
+        for char in text:
+            code = ord(char)
+            combining = (
+                0x0300 <= code <= 0x036F
+                or 0x1AB0 <= code <= 0x1AFF
+                or 0x1DC0 <= code <= 0x1DFF
+                or 0x20D0 <= code <= 0x20FF
+                or 0xFE00 <= code <= 0xFE0F
+                or 0xFE20 <= code <= 0xFE2F
+                or 0x1F3FB <= code <= 0x1F3FF
+                or code == 0x20E3
+            )
+            regional = 0x1F1E6 <= code <= 0x1F1FF
+
+            if not current:
+                current = char
+                regional_count = 1 if regional else 0
+            elif (
+                combining
+                or join_next
+                or char == "\u200d"
+                or (regional and regional_count == 1)
+            ):
+                current += char
+                if regional:
+                    regional_count += 1
+            else:
+                result.append(current)
+                current = char
+                regional_count = 1 if regional else 0
+
+            join_next = char == "\u200d"
+
+        if current:
+            result.append(current)
+        return result
+
+    def on_send_message_hook(self, account, params):
+        raw = getattr(params, "message", None)
+        if not isinstance(raw, str):
+            return HookResult()
+
+        stripped = raw.strip()
+        if not re.match(r"^\.type(?:\s|$)", stripped):
+            return HookResult()
+
+        match = re.match(r"^\.type(?:\s+([\s\S]*))?$", stripped)
+        full_text = (match.group(1) if match else "") or ""
+        full_text = full_text.strip()
+
+        if not full_text:
+            params.message = "Использование: .type <текст>"
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        if len(full_text) > self.MAX_TEXT_LENGTH:
+            params.message = (
+                "TypeWriter: текст слишком длинный "
+                "(максимум 3500 символов)."
+            )
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        chars = self._split_text(full_text)
+        if not chars:
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        peer = getattr(params, "peer", None)
+        if peer is None:
+            self.log("TypeWriter: не удалось определить чат.")
+            return HookResult()
+
+        state = {
+            "account": int(account),
+            "peer": peer,
+            "text": full_text,
+            "chars": chars,
+            "index": 1,
+            "message_id": None,
+            "stopped": False,
+        }
+
+        with self._lock:
+            self._pending.setdefault(int(account), []).append(state)
+
+        params.message = chars[0]
+        self.log("TypeWriter: отправляю первое сообщение")
+        return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+    def post_request_hook(self, request_name, account, response, error):
+        if request_name != "TL_messages_sendMessage":
+            return HookResult()
+
+        account = int(account)
+        with self._lock:
+            queue = self._pending.get(account) or []
+            if not queue:
+                return HookResult()
+            state = queue.pop(0)
+            if not queue:
+                self._pending.pop(account, None)
+
+        if error:
+            self.log(
+                "TypeWriter: первая буква не отправлена: "
+                + self._error_text(error)
+            )
+            return HookResult()
+
+        message_id = self._extract_message_id(response)
+        if message_id is None:
+            response_type = self._class_name(response)
+            self.log(
+                "TypeWriter: не удалось получить ID сообщения "
+                "(ответ: " + response_type + ")."
+            )
+            return HookResult()
+
+        state["message_id"] = message_id
+        self.log("TypeWriter: сообщение создано, запускаю печать")
+        self._schedule_next(state, self._next_delay())
+        return HookResult()
+
+    @staticmethod
+    def _class_name(obj):
+        if obj is None:
+            return "None"
+        try:
+            return str(obj.getClass().getSimpleName())
+        except Exception:
+            try:
+                return str(type(obj).__name__)
+            except Exception:
+                return "unknown"
+
+    @classmethod
+    def _extract_message_id(cls, response):
+        """
+        Telegram may answer sendMessage with TL_updateShortSentMessage,
+        or with a TL_updates container. Handle both response shapes.
+        """
+        if response is None:
+            return None
+
+        response_type = cls._class_name(response)
+
+        # Short response: the message ID is directly on the response.
+        if response_type == "TL_updateShortSentMessage":
+            try:
+                value = int(response.id)
+                return value if value > 0 else None
+            except Exception:
+                pass
+
+        # Standard response: find the ID in the updates list.
+        try:
+            updates = getattr(response, "updates", None)
+            if updates is not None:
+                update_list = list(updates)
+
+                # Prefer updateMessageID: it maps random_id to the final ID.
+                for update in update_list:
+                    if cls._class_name(update) == "TL_updateMessageID":
+                        value = int(update.id)
+                        if value > 0:
+                            return value
+
+                for update in update_list:
+                    update_type = cls._class_name(update)
+                    if update_type in (
+                        "TL_updateNewMessage",
+                        "TL_updateNewChannelMessage",
+                    ):
+                        value = int(update.message.id)
+                        if value > 0:
+                            return value
+        except Exception:
+            pass
+
+        # Some forks wrap or expose the short-sent fields differently.
+        if "ShortSentMessage" in response_type:
+            try:
+                value = int(response.id)
+                return value if value > 0 else None
+            except Exception:
+                pass
+
+        return None
+
+    @staticmethod
+    def _error_text(error):
+        try:
+            return str(error.text)
+        except Exception:
+            return str(error)
+
+    def _schedule_next(self, state, delay_ms):
+        if state.get("stopped"):
+            return
+        run_on_queue(
+            lambda: self._edit_next(state),
+            GLOBAL_QUEUE,
+            int(max(0, delay_ms)),
+        )
+
+    def _edit_next(self, state):
+        if state.get("stopped"):
+            return
+
+        chars = state["chars"]
+        index = state["index"]
+
+        if index >= len(chars):
+            self.log("TypeWriter: печать завершена")
+            return
+
+        new_text = "".join(chars[: index + 1])
+
+        try:
+            controller = get_messages_controller(state["account"])
+            peer_value = state["peer"]
+            input_peer = peer_value
+
+            # The outgoing-message hook normally supplies a dialog ID.
+            # If it already supplies InputPeer, keep it unchanged.
+            try:
+                peer_class = self._class_name(peer_value)
+                if not peer_class.startswith("TL_inputPeer"):
+                    input_peer = controller.getInputPeer(int(peer_value))
+            except Exception:
+                input_peer = controller.getInputPeer(int(peer_value))
+
+            request = TLRPC.TL_messages_editMessage()
+            request.peer = input_peer
+            request.id = int(state["message_id"])
+            request.message = new_text
+            request.no_webpage = True
+
+            def callback(response, error):
+                if state.get("stopped"):
+                    return
+
+                if error:
+                    self._handle_edit_error(state, error)
+                    return
+
+                state["index"] += 1
+                self._schedule_next(state, self._next_delay())
+
+            send_request(
+                request,
+                callback,
+                account=state["account"],
+            )
+
+        except Exception as exc:
+            state["stopped"] = True
+            self.log("TypeWriter: ошибка редактирования: " + str(exc))
+
+    def _handle_edit_error(self, state, error):
+        message = self._error_text(error)
+        match = re.search(r"FLOOD_WAIT_(\d+)", message)
+
+        if match:
+            seconds = int(match.group(1))
+            if self.get_setting("floodwait_protection", True):
+                self.log(
+                    "FloodWait: жду "
+                    + str(seconds)
+                    + " сек., затем продолжу."
+                )
+                self._schedule_next(state, (seconds + 1) * 1000)
+            else:
+                state["stopped"] = True
+                self.log(
+                    "FloodWait Protection выключена: "
+                    "печать остановлена. " + message
+                )
+            return
+
+        state["stopped"] = True
+        self.log("TypeWriter остановлен: " + message)
